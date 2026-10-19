@@ -12,7 +12,11 @@
 Traditional smart contracts cannot read or evaluate off-chain deliverables such as pull requests, deployed web applications, audit reports, or design assets without trusting centralized oracles or subjective multi-sig committees. Conversely, naive Web3 LLM integrations are vulnerable to prompt injection, hallucinated outputs, non-deterministic floats, and state-desynchronization forks.
 
 **`MilestoneRelease`** is a production-grade GenLayer Intelligent Contract that bridges untrusted off-chain deliverable evidence with deterministic on-chain financial settlement. It implements:
-- **Decentralized Multi-Validator Consensus:** Leverages GenLayer's GenVM execution environment (`gl.vm.run_nondet_unsafe`) to fetch web deliverable evidence and evaluate it across independent validators.
+- **Value-Backed Payable Escrow:** Escrow is strictly backed by native attached token value (`gl.message.value`) via `@gl.public.write.payable` rather than crediting arbitrary numerical parameters. Both `deposit_escrow()` and `create_milestone()` enforce genuine on-chain value backing.
+- **Real On-Chain Withdrawal / Payout Path:** Implements Checks-Effects-Interactions (CEI) compliant `withdraw(amount)` with native value transfers via `gl.ContractAt(sender).emit_transfer(value=amount)` and comprehensive withdrawal accounting (`get_withdrawn_total`).
+- **Restricted Epoch Advance & Anti-Partisan Guardrails:** Restricts `advance_epoch(steps)` exclusively to an authorized `timelock_keeper` (1–50 steps max), with an immutable guardrail preventing any keeper from advancing the clock if they are client or contributor on any currently `PROVISIONAL` milestone.
+- **Early Settlement via Counterparty Dispute Waiver:** Parties can finalize a `PROVISIONAL` milestone early via `waive_dispute_window(milestone_id)`—enforcing valid counterparty protection (client waiver for 100% payouts, contributor waiver for 0% rejections, and mutual waiver for partial splits).
+- **Decentralized Multi-Validator Consensus:** Leverages GenVM execution (`gl.vm.run_nondet_unsafe`) to fetch web deliverable evidence and evaluate it across independent validators.
 - **Prompt Injection Defense & Untrusted Evidence Isolation:** Quarantines off-chain deliverable and rebuttal text inside strict XML isolation tags (`<DELIVERABLE_EVIDENCE>`, `<REBUTTAL_EVIDENCE>`) with immutable system instructions to ignore prompt-hijacking attempts.
 - **Deterministic Python Settlement Engine:** LLMs output raw criterion fulfillment IDs (`{"met_ids": ["C1", "C2"]}`). All weighted scoring (0–100), mandatory criterion gating, and payout tiers (0, 5000, 7500, 10000 bps) are calculated via exact integer arithmetic in deterministic Python.
 - **Two-Tier Appellate & Dispute Resolution:** Evaluated deliverables enter a time-locked `PROVISIONAL` status. Clients and contributors can lodge appeals with rebuttals and counter-evidence during the dispute window.
@@ -31,14 +35,16 @@ Traditional smart contracts cannot read or evaluate off-chain deliverables such 
 | **Network** | GenLayer StudioNet (`studionet`) |
 | **Chain ID** | `61999` |
 | **RPC Endpoint** | `https://studio.genlayer.com/api` |
-| **Active Deployed Contract Address** | `0xcD84E37659d1B179836Cb1CDEAc049eE219324F2` |
-| **Deployer Account (`ace-deployer`)** | `0xe4220c4b71877bb94eb173f467ef5c5557017085` |
-| **Deployment Transaction Hash** | `0x2765ca9244df34449ceda513e222ef6690e57ba69621cbbb184ccb09618b2fbf` |
-| **Consensus Outcome** | **`Accepted` / `MAJORITY_AGREE`** (5/5 validators voted `AGREE`) |
-| **Round Validators (5 nodes)** | `0xacc2459F341D7a887bcA8FAA62F1EC9378d4Bc67`<br>`0x5310dcF075E0BD47d29B8ec6581F736C767f54D2`<br>`0xcE1d6bBB36B744536153966B4DD42276f5ADd0F8`<br>`0x4404Fb70d490c935758146f42A73DC850FF95C71`<br>`0x4EDbE1FC9EAeC7b0EBA849b0C76AE73Eb0ad5C47` |
-| **Deposit Escrow Tx Hash** | `0x5d526db829019e104e8b38f2ee74c41279266a419531fd2e295413f844e337d6` (`MAJORITY_AGREE`, 5/5 `AGREE`) |
-| **Create Milestone Tx Hash** | `0x5fd49362e28a8333ba53a7fa61fed7c0fd2d4e79f473a07807b34da94eb8a689` (`MAJORITY_AGREE`, 3/5 `AGREE`, 2 `IDLE`) |
-| **Verified Live State (`get_milestone`)** | Milestone `1` `OPEN`, `escrow_amount: 10000`, 3 rubric criteria, 0 balance remaining |
+| **Active Deployed Contract Address** | `0xDB3CBE65D2beCA43aE42BF2B490055EFaFa86E6d` |
+| **Deployer Account (`ace-deployer`)** | `0xE4220c4b71877bb94EB173f467ef5c5557017085` |
+| **Deployment Transaction Hash** | `0x575ad509b61b8c2016b492a2199e5741649ef5281dd5086b8543732df02e49f5` |
+| **Consensus Outcome** | **`Accepted` / `MAJORITY_AGREE`** (5 round validators) |
+| **Deployment Round Validators (5 nodes)** | `0x5Bbbd7cdD63c0ba7f088038Cb049bDDAbE4F6fd1`<br>`0x6a4179A851B3747A458baD2f089AB2EeFE0eBbAb`<br>`0xad7d13f269CeAd4379E64a1A3a0803a827e70B43`<br>`0xe7eEe8a1c1690b0322d795B80A76ab2Cd1a0eAFd`<br>`0xA712cB25a4002666FA9D09477251f238dD9e06b3` |
+| **Payable Deposit Escrow Tx Hash** | `0x6dc1dadde47c3c114edb80026ca9b31f4ca9d064ed00708e428430adfdc2c835` (`MAJORITY_AGREE`, 5/5 `AGREE`) |
+| **Deposit Round Validators (5 nodes)** | `0xA712cB25a4002666FA9D09477251f238dD9e06b3`<br>`0xf29b6947ed298d139FC2655DB15D868C9AbB3091`<br>`0x892C437da9b9CA0b6017B6f046F58E3526B46ec6`<br>`0xb0925568bFbCF00aADBcA053E6D0E1628ff3d530`<br>`0x0B50B270Eba5D9B780272C4Cf4720260177e761D` |
+| **Create Milestone Tx Hash** | `0x8878c848d2a15b71fe74f3acbdb736a8372411ab2730c6a24c95dc55086d18e9` (`MAJORITY_AGREE`, 5 round validators) |
+| **Verified Live State (`get_milestone`)** | Milestone `1` `OPEN`, `escrow_amount: 10000`, 3 rubric criteria, waivers un-waived (`false`) |
+| **Verified Live State (`get_vault_summary`)** | `total_escrow_locked: 10000`, `milestone_count: 1`, `logical_epoch: 1`, `owner` & `keeper` verified |
 | **Explorer** | [https://genlayer-explorer.vercel.app](https://genlayer-explorer.vercel.app) |
 
 > [!NOTE]
@@ -52,20 +58,21 @@ The milestone lifecycle progresses through deterministic states, preventing race
 
 ```mermaid
 stateDiagram-v2
-    [*] --> OPEN: create_milestone (escrow locked)
+    [*] --> OPEN: create_milestone (payable / escrow locked)
     OPEN --> SUBMITTED: submit_deliverable (evidence_url)
     REWORK_REQUIRED --> SUBMITTED: submit_deliverable (rework attempt)
     SUBMITTED --> PROVISIONAL: evaluate_deliverable (AI consensus)
     
     state PROVISIONAL {
         [*] --> DisputeWindowActive
-        DisputeWindowActive --> DisputeWindowExpired: advance_epoch()
+        DisputeWindowActive --> DisputeWindowExpired: advance_epoch() [Keeper Only]
+        DisputeWindowActive --> EarlyFinalized: waive_dispute_window() [Counterparty/Mutual]
     }
     
     PROVISIONAL --> DISPUTED: challenge_verdict (rebuttal_url)
     DISPUTED --> FINALIZED: resolve_dispute (appellate consensus)
     
-    PROVISIONAL --> SETTLED: finalize_and_settle (payout > 0)
+    PROVISIONAL --> SETTLED: finalize_and_settle (payout > 0, window expired or waived)
     FINALIZED --> SETTLED: finalize_and_settle (payout > 0)
     
     PROVISIONAL --> REWORK_REQUIRED: finalize_and_settle (payout == 0, attempts < max)
@@ -74,8 +81,10 @@ stateDiagram-v2
     PROVISIONAL --> REFUNDED: finalize_and_settle (payout == 0, attempts >= max)
     FINALIZED --> REFUNDED: finalize_and_settle (payout == 0, attempts >= max)
     
-    SETTLED --> [*]
-    REFUNDED --> [*]
+    SETTLED --> WITHDRAWN: withdraw(amount) [CEI native transfer]
+    REFUNDED --> WITHDRAWN: withdraw(amount) [CEI native transfer]
+    
+    WITHDRAWN --> [*]
 ```
 
 ### Deterministic Payout Tiers & Rubric Weights
@@ -167,23 +176,30 @@ class MilestoneRecord:
     dispute_window_blocks: u256
     provisional_epoch: u256
     dispute_used: bool
+    client_waived_dispute: bool
+    contributor_waived_dispute: bool
 ```
 
 ### Public Methods
 
 | Method | Type | Access | Description |
 | :--- | :---: | :---: | :--- |
-| `deposit_escrow(amount)` | Write | Any | Deposits native tokens into user's contract balance. |
-| `advance_epoch(steps)` | Write | Any | Advances logical clock for deterministic dispute window testing. |
-| `create_milestone(contributor, title, rubric_json, escrow_amount, max_attempts, dispute_window_blocks)` | Write | Client | Locks escrow and creates an `OPEN` milestone. Validates 100-point rubric. |
+| `deposit_escrow()` | Write (Payable) | Any | Attaches native value (`gl.message.value > 0`) and credits depositor balance. |
+| `create_milestone(contributor, title, rubric_json, escrow_amount, max_attempts, dispute_window_blocks)` | Write (Payable) | Client | Credits any attached native value, validates 100-pt rubric, locks escrow into `total_escrow_locked`. |
+| `withdraw(amount)` | Write | Any | Checks-Effects-Interactions (CEI) withdrawal executing on-chain native transfer via `gl.ContractAt(sender).emit_transfer(value=amount)`. |
+| `set_timelock_keeper(new_keeper)` | Write | Owner | Configures authorized timelock keeper address. |
+| `advance_epoch(steps)` | Write | Timelock Keeper | Advances logical epoch by 1–50 steps. Reverts if keeper is client or contributor on any active `PROVISIONAL` milestone. |
+| `waive_dispute_window(milestone_id)` | Write | Parties | Counterparty waiver: client waives when 100% payout, contributor waives when 0%, or mutual waiver when partial. Early finalization. |
 | `submit_deliverable(milestone_id, evidence_url, submission_notes)` | Write | Contributor | Submits deliverable evidence. Validates HTTPS scheme and attempts counter. |
 | `evaluate_deliverable(milestone_id)` | Write | Any | Triggers multi-validator AI consensus evaluation. Transitions to `PROVISIONAL`. |
-| `challenge_verdict(milestone_id, rebuttal_url, challenge_reason)` | Write | Parties | Client or contributor challenges verdict before dispute window expires. |
+| `challenge_verdict(milestone_id, rebuttal_url, challenge_reason)` | Write | Parties | Client or contributor challenges provisional verdict before window expires or is waived. |
 | `resolve_dispute(milestone_id)` | Write | Any | Multi-source appellate consensus analyzing evidence + rebuttal. Transitions to `FINALIZED`. |
-| `finalize_and_settle(milestone_id)` | Write | Any | Enforces dispute window expiry. Distributes payouts, sets rework, or refunds client. |
-| `get_milestone(milestone_id)` | View | Public | Returns complete milestone state dictionary. |
+| `finalize_and_settle(milestone_id)` | Write | Any | Checks window expiry or valid waiver. Unlocks escrow and credits payouts, sets rework, or refunds client. |
+| `get_milestone(milestone_id)` | View | Public | Returns complete milestone state dictionary including waiver booleans. |
 | `get_balance(account)` | View | Public | Returns current deposited escrow balance of an account. |
-| `get_epoch()` | View | Public | Returns current contract logical epoch. |
+| `get_withdrawn_total(account)` | View | Public | Returns cumulative withdrawn native amount for an account. |
+| `get_logical_epoch()` | View | Public | Returns current contract logical epoch. |
+| `get_vault_summary()` | View | Public | Returns vault summary with owner, timelock keeper, locked escrow, epoch, and milestone count. |
 
 ---
 
@@ -192,27 +208,24 @@ class MilestoneRecord:
 ### Prerequisites
 - Python 3.10+
 - Node.js 18+ and `genlayer` CLI (`npm install -g genlayer`)
-- `genvm-lint` (`pip install genvm-lint`)
+- `genvm-linter` (`pip install genvm-linter`)
 - `gltest` (`pip install genlayer-test pytest`)
 
 ### 1. Run GenVM Static Analysis & Linting
 
 ```powershell
 $env:PYTHONIOENCODING="utf-8"
-genvm-lint check contracts/milestone_release.py
+genvm-lint check contracts/milestone_release.py --json
 ```
 
 **Expected output:**
-```
-✓ Lint passed (3 checks)
-✓ Validation passed
-  Contract: MilestoneRelease
-  Methods: 11 (3 view, 8 write)
+```json
+{"ok":true,"lint":{"ok":true,"passed":3},"validate":{"ok":true,"contract":"MilestoneRelease","methods":16,"view_methods":5,"write_methods":11,"ctor_params":0}}
 ```
 
 ### 2. Run Comprehensive Direct-Mode Test Suite
 
-The test suite simulates multi-validator environments, Web fetching, and LLM completions:
+The test suite simulates multi-validator environments, Web fetching, payable message values, on-chain native transfers, and LLM completions:
 
 ```powershell
 pytest tests/test_milestone_release_direct.py -v
@@ -220,33 +233,44 @@ pytest tests/test_milestone_release_direct.py -v
 
 **Expected output:**
 ```
-tests/test_milestone_release_direct.py::test_partial_eval_dispute_lock_and_appellate_upgrade PASSED [ 25%]
-tests/test_milestone_release_direct.py::test_mandatory_failure_rework_cycle_and_refund PASSED       [ 50%]
-tests/test_milestone_release_direct.py::test_validator_disagreement PASSED                          [ 75%]
+tests/test_milestone_release_direct.py::test_partial_eval_dispute_lock_and_appellate_upgrade PASSED [ 16%]
+tests/test_milestone_release_direct.py::test_mandatory_failure_rework_cycle_and_refund PASSED       [ 33%]
+tests/test_milestone_release_direct.py::test_advance_epoch_restrictions_and_waive_dispute_window PASSED [ 50%]
+tests/test_milestone_release_direct.py::test_value_backed_escrow_and_direct_creation PASSED       [ 66%]
+tests/test_milestone_release_direct.py::test_validator_disagreement PASSED                          [ 83%]
 tests/test_milestone_release_direct.py::test_guardrails_and_reverts PASSED                          [100%]
 
-============================== 4 passed in 6.86s ==============================
+============================== 6 passed in 17.94s ==============================
 ```
 
 #### Test Scenarios Covered
 1. **`test_partial_eval_dispute_lock_and_appellate_upgrade`**:
-   - Alice creates a 3-criteria milestone with 10,000 escrow.
-   - Bob submits deliverable URL.
-   - Evaluated as `PARTIAL_75` (score 75, payout 7500 bps).
+   - Alice creates a 3-criteria milestone with 10,000 native payable escrow.
+   - Bob submits deliverable URL; evaluated as `PARTIAL_75` (score 75, payout 7500 bps).
    - Verifies `finalize_and_settle` reverts with `"Dispute window is still active"` when attempted before window expiration.
    - Bob lodges an appeal with on-chain transaction rebuttal evidence.
    - Appellate evaluation upgrades verdict to `FULL` (score 100, payout 10000 bps).
-   - Settle pays out 10,000 to Bob and 0 to Alice.
+   - Settlement distributes 10,000 to Bob and 0 to Alice.
+   - Bob executes native on-chain withdrawal via `withdraw(amount)`, updating balances and withdrawn totals.
 2. **`test_mandatory_failure_rework_cycle_and_refund`**:
-   - Optional criteria pass (50 points), but mandatory criterion `C1` fails.
-   - Contract forces `REJECTED` (0 bps).
-   - Attempt 1 settlement triggers `REWORK_REQUIRED`.
-   - Bob resubmits, fails again.
-   - Max attempts exhausted triggers automatic 100% refund (`REFUNDED`) back to Alice.
-3. **`test_validator_disagreement`**:
-   - Leader proposes `FULL` tier, but validator evaluates as `PARTIAL_75`.
+   - Owner appoints Charlie as non-partisan keeper.
+   - Mandatory criterion `C1` fails; contract forces `REJECTED` (0 bps).
+   - Non-partisan keeper advances epoch; attempt 1 triggers `REWORK_REQUIRED`.
+   - Bob resubmits, fails again. All attempts exhausted triggers automatic 100% refund (`REFUNDED`) back to Alice.
+   - Alice withdraws refunded native balance.
+3. **`test_advance_epoch_restrictions_and_waive_dispute_window`**:
+   - Arbitrary caller cannot advance epoch.
+   - Partisan keeper (party to a `PROVISIONAL` milestone) cannot advance epoch.
+   - Steps outside 1..50 bounds revert.
+   - Early finalization via counterparty waiver (`waive_dispute_window`) without needing epoch advancement.
+4. **`test_value_backed_escrow_and_direct_creation`**:
+   - `deposit_escrow()` with 0 attached value reverts with explicit requirement message.
+   - Positive attached value credits balance.
+   - `create_milestone()` with attached value directly credits and locks escrow.
+5. **`test_validator_disagreement`**:
+   - Leader proposes `FULL` tier, but validator evaluates as `PARTIAL_50`.
    - `direct_vm.run_validator()` detects discrepancy and returns `False`, proving divergence protection.
-4. **`test_guardrails_and_reverts`**:
+6. **`test_guardrails_and_reverts`**:
    - Validates reverts on rubric weights != 100, non-HTTPS URLs, self-contracting, and unauthorized dispute challenges.
 
 ---
@@ -257,10 +281,10 @@ tests/test_milestone_release_direct.py::test_guardrails_and_reverts PASSED      
 milestone_release/
 ├── .gitignore                        # Git exclusion patterns
 ├── contracts/
-│   └── milestone_release.py          # Intelligent Contract implementation
+│   └── milestone_release.py          # Value-backed payable escrow & dispute resolution contract
 ├── tests/
-│   ├── conftest.py                   # Pytest fixtures and run_nondet hook
-│   └── test_milestone_release_direct.py # 4 end-to-end direct-mode tests
+│   ├── conftest.py                   # Pytest fixtures, gl_call emit_transfer hook & VMContext setup
+│   └── test_milestone_release_direct.py # 6 comprehensive direct-mode test scenarios
 └── README.md                         # Architecture, verification & deployment report
 ```
 
@@ -268,4 +292,4 @@ milestone_release/
 
 ## 8. Conclusion
 
-`MilestoneRelease` demonstrates how GenLayer turns Large Language Models into trust-minimized, objective arbiters of digital labor. By combining prompt isolation, multi-validator consensus equivalence, deterministic integer mathematics, and economic dispute windows, it solves the oracle problem for off-chain deliverable settlement.
+`MilestoneRelease` demonstrates how GenLayer turns Large Language Models into trust-minimized, objective arbiters of digital labor. By combining value-backed payable escrow, native transfer withdrawals, anti-partisan dispute timers, counterparty waivers, and multi-validator consensus equivalence, it delivers an institutional-grade primitive for autonomous on-chain deliverable settlement.

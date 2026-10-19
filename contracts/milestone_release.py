@@ -4,6 +4,15 @@ from genlayer import *
 from dataclasses import dataclass
 import json
 
+# Ensure ContractAt is available on gl for cross-contract / native transfer interop
+if not hasattr(gl, "ContractAt"):
+    if hasattr(gl, "get_contract_at"):
+        gl.ContractAt = gl.get_contract_at
+    elif hasattr(gl, "contract") and hasattr(gl.contract, "get_at"):
+        gl.ContractAt = gl.contract.get_at
+    elif hasattr(gl, "contract") and hasattr(gl.contract, "_ContractAt"):
+        gl.ContractAt = gl.contract._ContractAt
+
 
 @allow_storage
 @dataclass
@@ -30,6 +39,8 @@ class MilestoneRecord:
     dispute_window_blocks: u256
     provisional_epoch: u256
     dispute_used: bool
+    client_waived_dispute: bool
+    contributor_waived_dispute: bool
 
 
 def _parse_llm_json(raw_resp) -> dict:
@@ -163,12 +174,20 @@ def _to_address(addr) -> Address:
 
 
 class MilestoneRelease(gl.Contract):
+    owner: Address
+    timelock_keeper: Address
     balances: TreeMap[Address, u256]
+    withdrawn_totals: TreeMap[Address, u256]
+    total_escrow_locked: u256
     milestones: TreeMap[u256, MilestoneRecord]
     milestone_count: u256
     logical_epoch: u256
 
     def __init__(self):
+        deployer = _to_address(gl.message.sender_address)
+        self.owner = deployer
+        self.timelock_keeper = deployer
+        self.total_escrow_locked = u256(0)
         self.milestone_count = u256(0)
         self.logical_epoch = u256(0)
 
@@ -226,22 +245,69 @@ class MilestoneRelease(gl.Contract):
         return gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
 
     @gl.public.write
-    def deposit_escrow(self, amount: u256) -> None:
-        if amount <= 0:
-            raise gl.vm.UserError("Deposit amount must be greater than 0")
+    def set_timelock_keeper(self, new_keeper: Address) -> None:
+        sender = _to_address(gl.message.sender_address)
+        if sender != self.owner:
+            raise gl.vm.UserError("Only owner can set timelock keeper")
+        self.timelock_keeper = _to_address(new_keeper)
+
+    @gl.public.write.payable
+    def deposit_escrow(self) -> u256:
+        attached_value = u256(gl.message.value)
+        if attached_value == 0:
+            raise gl.vm.UserError("Must attach positive native value (gl.message.value > 0) to deposit_escrow")
         sender = _to_address(gl.message.sender_address)
         current_bal = self.balances.get(sender, u256(0))
-        self.balances[sender] = current_bal + amount
+        new_bal = current_bal + attached_value
+        self.balances[sender] = new_bal
         self.logical_epoch = self.logical_epoch + u256(1)
+        return new_bal
+
+    @gl.public.write
+    def withdraw(self, amount: u256) -> dict:
+        if amount <= 0:
+            raise gl.vm.UserError("Withdrawal amount must be greater than 0")
+        sender = _to_address(gl.message.sender_address)
+        sender_bal = self.balances.get(sender, u256(0))
+        if sender_bal < amount:
+            raise gl.vm.UserError("Insufficient balance to withdraw")
+
+        # Checks-Effects-Interactions (CEI)
+        remaining_bal = sender_bal - amount
+        self.balances[sender] = remaining_bal
+        prev_withdrawn = self.withdrawn_totals.get(sender, u256(0))
+        total_withdrawn = prev_withdrawn + amount
+        self.withdrawn_totals[sender] = total_withdrawn
+
+        # On-chain native value transfer
+        gl.ContractAt(sender).emit_transfer(value=amount)
+
+        return {
+            "account": sender.as_hex,
+            "amount": int(amount),
+            "remaining_balance": int(remaining_bal),
+            "total_withdrawn": int(total_withdrawn),
+        }
 
     @gl.public.write
     def advance_epoch(self, steps: u256) -> u256:
-        if steps <= 0:
-            raise gl.vm.UserError("Steps must be greater than 0")
+        sender = _to_address(gl.message.sender_address)
+        if sender != self.timelock_keeper:
+            raise gl.vm.UserError("Only timelock keeper can advance epoch")
+        if steps < 1 or steps > 50:
+            raise gl.vm.UserError("Steps must be between 1 and 50")
+
+        # Verify keeper is not party to any active PROVISIONAL milestone
+        for i in range(1, int(self.milestone_count) + 1):
+            m = self.milestones[u256(i)]
+            if m.status == "PROVISIONAL":
+                if sender == m.client or sender == m.contributor:
+                    raise gl.vm.UserError("Partisan keeper cannot advance epoch while party to an active PROVISIONAL milestone")
+
         self.logical_epoch = self.logical_epoch + steps
         return self.logical_epoch
 
-    @gl.public.write
+    @gl.public.write.payable
     def create_milestone(
         self,
         contributor: Address,
@@ -304,10 +370,16 @@ class MilestoneRelease(gl.Contract):
         if total_weight != 100:
             raise gl.vm.UserError(f"Rubric weights must sum to exactly 100 (got {total_weight})")
 
+        # Credit attached native value if any
+        attached_value = u256(gl.message.value)
+        if attached_value > 0:
+            self.balances[sender] = self.balances.get(sender, u256(0)) + attached_value
+
         sender_bal = self.balances.get(sender, u256(0))
         if sender_bal < escrow_amount:
             raise gl.vm.UserError("Insufficient balance in escrow deposit")
         self.balances[sender] = sender_bal - escrow_amount
+        self.total_escrow_locked = self.total_escrow_locked + escrow_amount
 
         self.milestone_count = self.milestone_count + u256(1)
         m_id = self.milestone_count
@@ -335,6 +407,8 @@ class MilestoneRelease(gl.Contract):
             dispute_window_blocks=dispute_window_blocks,
             provisional_epoch=u256(0),
             dispute_used=False,
+            client_waived_dispute=False,
+            contributor_waived_dispute=False,
         )
         self.milestones[m_id] = record
         return m_id
@@ -365,6 +439,8 @@ class MilestoneRelease(gl.Contract):
         m.rebuttal_url = ""
         m.challenge_reason = ""
         m.status = "SUBMITTED"
+        m.client_waived_dispute = False
+        m.contributor_waived_dispute = False
         self.milestones[milestone_id] = m
 
     @gl.public.write
@@ -391,8 +467,50 @@ class MilestoneRelease(gl.Contract):
         m.audit_rationale = result["rationale"]
         m.provisional_epoch = self.logical_epoch
         m.status = "PROVISIONAL"
+        m.client_waived_dispute = False
+        m.contributor_waived_dispute = False
         self.milestones[milestone_id] = m
         return result
+
+    @gl.public.write
+    def waive_dispute_window(self, milestone_id: u256) -> str:
+        if milestone_id not in self.milestones:
+            raise gl.vm.UserError("Milestone not found")
+        m = self.milestones[milestone_id]
+        if m.status != "PROVISIONAL":
+            raise gl.vm.UserError("Milestone is not in PROVISIONAL status")
+
+        sender = _to_address(gl.message.sender_address)
+        if sender != m.client and sender != m.contributor:
+            raise gl.vm.UserError("Only client or contributor can waive dispute window")
+
+        if sender == m.client:
+            m.client_waived_dispute = True
+        if sender == m.contributor:
+            m.contributor_waived_dispute = True
+
+        # Counterparty / mutual waiver logic:
+        # - client waiver when payout_bps == 10000
+        # - contributor waiver when payout_bps == 0
+        # - both waiving when partial payout (0 < payout_bps < 10000)
+        fully_waived = False
+        if m.payout_bps == 10000:
+            if m.client_waived_dispute:
+                fully_waived = True
+        elif m.payout_bps == 0:
+            if m.contributor_waived_dispute:
+                fully_waived = True
+        else:
+            if m.client_waived_dispute and m.contributor_waived_dispute:
+                fully_waived = True
+
+        if fully_waived:
+            m.status = "FINALIZED"
+            self.milestones[milestone_id] = m
+            return "WAIVED_AND_FINALIZED"
+
+        self.milestones[milestone_id] = m
+        return "WAIVER_RECORDED"
 
     @gl.public.write
     def challenge_verdict(
@@ -457,7 +575,15 @@ class MilestoneRelease(gl.Contract):
         m = self.milestones[milestone_id]
 
         if m.status == "PROVISIONAL":
-            if self.logical_epoch <= m.provisional_epoch + m.dispute_window_blocks:
+            is_waived = False
+            if m.payout_bps == 10000 and m.client_waived_dispute:
+                is_waived = True
+            elif m.payout_bps == 0 and m.contributor_waived_dispute:
+                is_waived = True
+            elif m.client_waived_dispute and m.contributor_waived_dispute:
+                is_waived = True
+
+            if not is_waived and self.logical_epoch <= m.provisional_epoch + m.dispute_window_blocks:
                 raise gl.vm.UserError("Dispute window is still active")
         elif m.status != "FINALIZED":
             raise gl.vm.UserError("Milestone must be PROVISIONAL with expired window or FINALIZED to settle")
@@ -466,14 +592,18 @@ class MilestoneRelease(gl.Contract):
             if m.attempts_used < m.max_attempts:
                 m.status = "REWORK_REQUIRED"
                 m.dispute_used = False
+                m.client_waived_dispute = False
+                m.contributor_waived_dispute = False
                 self.milestones[milestone_id] = m
                 return "REWORK_REQUIRED"
             else:
                 m.status = "REFUNDED"
+                self.total_escrow_locked = self.total_escrow_locked - m.escrow_amount
                 self.balances[m.client] = self.balances.get(m.client, u256(0)) + m.escrow_amount
                 self.milestones[milestone_id] = m
                 return "REFUNDED"
         else:
+            self.total_escrow_locked = self.total_escrow_locked - m.escrow_amount
             contributor_payout = (m.escrow_amount * m.payout_bps) // u256(10000)
             client_refund = m.escrow_amount - contributor_payout
             self.balances[m.contributor] = self.balances.get(m.contributor, u256(0)) + contributor_payout
@@ -511,6 +641,8 @@ class MilestoneRelease(gl.Contract):
             "dispute_window_blocks": int(m.dispute_window_blocks),
             "provisional_epoch": int(m.provisional_epoch),
             "dispute_used": m.dispute_used,
+            "client_waived_dispute": m.client_waived_dispute,
+            "contributor_waived_dispute": m.contributor_waived_dispute,
         }
 
     @gl.public.view
@@ -519,5 +651,20 @@ class MilestoneRelease(gl.Contract):
         return int(self.balances.get(acc, u256(0)))
 
     @gl.public.view
+    def get_withdrawn_total(self, account: Address) -> int:
+        acc = _to_address(account)
+        return int(self.withdrawn_totals.get(acc, u256(0)))
+
+    @gl.public.view
     def get_logical_epoch(self) -> int:
         return int(self.logical_epoch)
+
+    @gl.public.view
+    def get_vault_summary(self) -> dict:
+        return {
+            "owner": self.owner.as_hex,
+            "timelock_keeper": self.timelock_keeper.as_hex,
+            "milestone_count": int(self.milestone_count),
+            "total_escrow_locked": int(self.total_escrow_locked),
+            "logical_epoch": int(self.logical_epoch),
+        }

@@ -2,10 +2,18 @@ import json
 import pytest
 
 
+def _hex_str(addr) -> str:
+    if hasattr(addr, "as_hex"):
+        return addr.as_hex.lower()
+    if isinstance(addr, bytes):
+        return ("0x" + addr.hex()).lower()
+    return str(addr).lower()
+
+
 def test_partial_eval_dispute_lock_and_appellate_upgrade(direct_vm, direct_deploy, direct_alice, direct_bob):
     """
     Scenario 1:
-    - Alice deposits 10000 and creates a milestone with 3 criteria (C1=50 mandatory, C2=25, C3=25).
+    - Alice deposits 10000 native value via payable deposit_escrow() and creates a milestone.
     - Bob submits deliverable.
     - Mock web and LLM so C1 and C2 pass (score=75, PARTIAL_75, payout_bps=7500).
     - Assert direct_vm.run_validator() is True.
@@ -13,12 +21,16 @@ def test_partial_eval_dispute_lock_and_appellate_upgrade(direct_vm, direct_deplo
     - Bob calls challenge_verdict with rebuttal URL.
     - Re-mock web + LLM so C1, C2, and C3 pass (score=100, FULL, payout_bps=10000).
     - Resolve dispute, settle immediately, and verify Bob's balance is 10000 and Alice's is 0.
+    - Verify Bob executes native on-chain withdrawal via withdraw(amount) with CEI and balance updates.
     """
+    direct_vm.sender = direct_alice
     contract = direct_deploy("contracts/milestone_release.py")
 
-    # Alice deposits escrow
+    # Alice deposits payable escrow
     direct_vm.sender = direct_alice
-    contract.deposit_escrow(10000)
+    direct_vm.value = 10000
+    contract.deposit_escrow()
+    direct_vm.value = 0
     assert contract.get_balance(direct_alice) == 10000
 
     rubric = [
@@ -37,6 +49,10 @@ def test_partial_eval_dispute_lock_and_appellate_upgrade(direct_vm, direct_deplo
     )
     assert m_id == 1
     assert contract.get_balance(direct_alice) == 0
+
+    vault_summary = contract.get_vault_summary()
+    assert vault_summary["total_escrow_locked"] == 10000
+    assert vault_summary["milestone_count"] == 1
 
     # Bob submits deliverable
     direct_vm.sender = direct_bob
@@ -107,23 +123,58 @@ def test_partial_eval_dispute_lock_and_appellate_upgrade(direct_vm, direct_deplo
     settle_status = contract.finalize_and_settle(m_id)
     assert settle_status == "SETTLED"
 
-    # Verify final payout balances
+    # Verify final payout balances in contract
     assert contract.get_balance(direct_bob) == 10000
     assert contract.get_balance(direct_alice) == 0
+    assert contract.get_vault_summary()["total_escrow_locked"] == 0
+
+    # Real payout withdrawal by Bob
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("Withdrawal amount must be greater than 0"):
+        contract.withdraw(0)
+
+    with direct_vm.expect_revert("Insufficient balance to withdraw"):
+        contract.withdraw(12000)
+
+    # Partial withdrawal
+    withdraw_res1 = contract.withdraw(4000)
+    assert withdraw_res1["amount"] == 4000
+    assert withdraw_res1["remaining_balance"] == 6000
+    assert withdraw_res1["total_withdrawn"] == 4000
+    assert contract.get_balance(direct_bob) == 6000
+    assert contract.get_withdrawn_total(direct_bob) == 4000
+
+    # Complete withdrawal
+    withdraw_res2 = contract.withdraw(6000)
+    assert withdraw_res2["amount"] == 6000
+    assert withdraw_res2["remaining_balance"] == 0
+    assert withdraw_res2["total_withdrawn"] == 10000
+    assert contract.get_balance(direct_bob) == 0
+    assert contract.get_withdrawn_total(direct_bob) == 10000
 
 
-def test_mandatory_failure_rework_cycle_and_refund(direct_vm, direct_deploy, direct_alice, direct_bob):
+def test_mandatory_failure_rework_cycle_and_refund(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
     """
     Scenario 2:
+    - Alice deploys contract and sets Charlie as non-partisan timelock keeper.
     - Milestone where optional criteria pass (50 weight) but mandatory C1 fails.
     - Verifies it forces REJECTED (0 bps).
-    - Advance epoch past dispute window -> REWORK_REQUIRED when attempts remain.
+    - Advance epoch past dispute window via non-partisan keeper -> REWORK_REQUIRED when attempts remain.
     - Contributor resubmits, fails again, window passes -> REFUNDED to Alice when attempts exhausted.
+    - Alice withdraws refunded native balance.
     """
+    direct_vm.sender = direct_alice
     contract = direct_deploy("contracts/milestone_release.py")
 
+    # Set non-partisan timelock keeper
+    contract.set_timelock_keeper(direct_charlie)
+    assert contract.get_vault_summary()["timelock_keeper"].lower() == _hex_str(direct_charlie)
+
+    # Alice deposits escrow
     direct_vm.sender = direct_alice
-    contract.deposit_escrow(10000)
+    direct_vm.value = 10000
+    contract.deposit_escrow()
+    direct_vm.value = 0
 
     rubric = [
         {"id": "C1", "description": "Mandatory security audit", "weight": 50, "mandatory": True},
@@ -163,10 +214,12 @@ def test_mandatory_failure_rework_cycle_and_refund(direct_vm, direct_deploy, dir
     assert res1["tier"] == "REJECTED"
     assert res1["payout_bps"] == 0
 
-    # Advance epoch past dispute window (3 blocks)
+    # Advance epoch past dispute window (3 blocks) via keeper Charlie
+    direct_vm.sender = direct_charlie
     contract.advance_epoch(4)
 
     # Attempt 1 settlement -> REWORK_REQUIRED (attempt 1 of 2)
+    direct_vm.sender = direct_alice
     status1 = contract.finalize_and_settle(m_id)
     assert status1 == "REWORK_REQUIRED"
     record1 = contract.get_milestone(m_id)
@@ -174,6 +227,7 @@ def test_mandatory_failure_rework_cycle_and_refund(direct_vm, direct_deploy, dir
     assert record1["dispute_used"] is False
 
     # Attempt 2: Bob resubmits
+    direct_vm.sender = direct_bob
     contract.submit_deliverable(
         m_id,
         "https://github.com/example/security-module/pull/2",
@@ -189,9 +243,11 @@ def test_mandatory_failure_rework_cycle_and_refund(direct_vm, direct_deploy, dir
     assert res2["payout_bps"] == 0
 
     # Advance epoch past dispute window
+    direct_vm.sender = direct_charlie
     contract.advance_epoch(4)
 
     # Attempt 2 settlement -> REFUNDED (all attempts exhausted)
+    direct_vm.sender = direct_alice
     status2 = contract.finalize_and_settle(m_id)
     assert status2 == "REFUNDED"
     record_final = contract.get_milestone(m_id)
@@ -201,17 +257,143 @@ def test_mandatory_failure_rework_cycle_and_refund(direct_vm, direct_deploy, dir
     assert contract.get_balance(direct_alice) == 10000
     assert contract.get_balance(direct_bob) == 0
 
+    # Alice withdraws her refunded escrow
+    withdraw_res = contract.withdraw(10000)
+    assert withdraw_res["amount"] == 10000
+    assert contract.get_balance(direct_alice) == 0
+    assert contract.get_withdrawn_total(direct_alice) == 10000
+
+
+def test_advance_epoch_restrictions_and_waive_dispute_window(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    """
+    Scenario 3:
+    - Tests access control on advance_epoch (only keeper can call).
+    - Tests partisan keeper restriction: keeper cannot advance epoch if party to an active PROVISIONAL milestone.
+    - Tests steps bounds (1 <= steps <= 50).
+    - Tests early finalization via counterparty/mutual waiver (waive_dispute_window).
+    """
+    direct_vm.sender = direct_alice
+    contract = direct_deploy("contracts/milestone_release.py")
+
+    # Deployer is initial keeper
+    summary = contract.get_vault_summary()
+    assert summary["owner"].lower() == _hex_str(direct_alice)
+    assert summary["timelock_keeper"].lower() == _hex_str(direct_alice)
+
+    # Arbitrary caller (Bob) cannot advance epoch
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("Only timelock keeper can advance epoch"):
+        contract.advance_epoch(1)
+
+    # Alice deposits escrow and creates milestone
+    direct_vm.sender = direct_alice
+    direct_vm.value = 10000
+    contract.deposit_escrow()
+    direct_vm.value = 0
+
+    rubric = [{"id": "C1", "description": "Core protocol", "weight": 100, "mandatory": True}]
+    m_id = contract.create_milestone(direct_bob, "Core Protocol", json.dumps(rubric), 10000, 2, 10)
+
+    # Bob submits deliverable
+    direct_vm.sender = direct_bob
+    contract.submit_deliverable(m_id, "https://github.com/example/core", "Code completed")
+
+    direct_vm.mock_web(r".*github\.com/example/core.*", {"status": 200, "body": "Core protocol code"})
+    direct_vm.mock_llm(r".*objective.*milestone evaluation auditor.*", json.dumps({"met_ids": ["C1"], "rationale": "C1 complete"}))
+
+    contract.evaluate_deliverable(m_id)
+    assert contract.get_milestone(m_id)["status"] == "PROVISIONAL"
+
+    # Partisan keeper check: Alice is keeper AND client on milestone 1 (PROVISIONAL)
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("Partisan keeper cannot advance epoch while party to an active PROVISIONAL milestone"):
+        contract.advance_epoch(5)
+
+    # Alice sets Charlie as non-partisan keeper
+    contract.set_timelock_keeper(direct_charlie)
+
+    # Keeper bounds check
+    direct_vm.sender = direct_charlie
+    with direct_vm.expect_revert("Steps must be between 1 and 50"):
+        contract.advance_epoch(0)
+    with direct_vm.expect_revert("Steps must be between 1 and 50"):
+        contract.advance_epoch(51)
+
+    # Non-partisan keeper can advance epoch
+    new_epoch = contract.advance_epoch(2)
+    assert new_epoch >= 2
+
+    # Milestone 1 is FULL payout (10000 bps) -> counterparty (client Alice) waiver allows early finalization
+    # Contributor (Bob) waiving records waiver but doesn't finalize alone on 100% payout
+    direct_vm.sender = direct_bob
+    w_status1 = contract.waive_dispute_window(m_id)
+    assert w_status1 == "WAIVER_RECORDED"
+    assert contract.get_milestone(m_id)["status"] == "PROVISIONAL"
+
+    # Client (Alice) waives -> triggers WAIVED_AND_FINALIZED
+    direct_vm.sender = direct_alice
+    w_status2 = contract.waive_dispute_window(m_id)
+    assert w_status2 == "WAIVED_AND_FINALIZED"
+    assert contract.get_milestone(m_id)["status"] == "FINALIZED"
+
+    # Immediate settlement succeeds without having to advance epoch past window
+    settle_res = contract.finalize_and_settle(m_id)
+    assert settle_res == "SETTLED"
+    assert contract.get_balance(direct_bob) == 10000
+
+
+def test_value_backed_escrow_and_direct_creation(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """
+    Scenario 4:
+    - Deposit with 0 attached value reverts.
+    - Deposit with attached value succeeds and increments balance.
+    - Create milestone with attached value directly (without prior deposit) credits and locks escrow.
+    """
+    direct_vm.sender = direct_alice
+    contract = direct_deploy("contracts/milestone_release.py")
+
+    # Deposit with 0 attached value reverts
+    direct_vm.value = 0
+    with direct_vm.expect_revert("Must attach positive native value (gl.message.value > 0) to deposit_escrow"):
+        contract.deposit_escrow()
+
+    # Deposit with positive attached value succeeds
+    direct_vm.value = 5000
+    new_bal = contract.deposit_escrow()
+    direct_vm.value = 0
+    assert new_bal == 5000
+    assert contract.get_balance(direct_alice) == 5000
+
+    # Create milestone directly attaching additional native value
+    rubric = [{"id": "C1", "description": "Deliverable", "weight": 100, "mandatory": True}]
+    # Alice has 5000 in balance, attaches 5000 more with create_milestone to lock 10000 total escrow
+    direct_vm.value = 5000
+    m_id = contract.create_milestone(
+        direct_bob,
+        "Direct Value Milestone",
+        json.dumps(rubric),
+        10000,
+        2,
+        5,
+    )
+    direct_vm.value = 0
+    assert m_id == 1
+    assert contract.get_balance(direct_alice) == 0
+    assert contract.get_vault_summary()["total_escrow_locked"] == 10000
+
 
 def test_validator_disagreement(direct_vm, direct_deploy, direct_alice, direct_bob):
     """
-    Scenario 3:
+    Scenario 5:
     - Verify direct_vm.run_validator() returns False if the validator's mocked LLM output
       produces a different payout tier than the leader's result.
     """
+    direct_vm.sender = direct_alice
     contract = direct_deploy("contracts/milestone_release.py")
 
-    direct_vm.sender = direct_alice
-    contract.deposit_escrow(10000)
+    direct_vm.value = 10000
+    contract.deposit_escrow()
+    direct_vm.value = 0
 
     rubric = [
         {"id": "C1", "description": "Core engine implementation", "weight": 50, "mandatory": True},
@@ -266,17 +448,21 @@ def test_validator_disagreement(direct_vm, direct_deploy, direct_alice, direct_b
 
 def test_guardrails_and_reverts(direct_vm, direct_deploy, direct_alice, direct_bob):
     """
-    Scenario 4:
+    Scenario 6:
     - Input validation and deterministic guardrails.
     """
-    contract = direct_deploy("contracts/milestone_release.py")
     direct_vm.sender = direct_alice
+    contract = direct_deploy("contracts/milestone_release.py")
 
-    # Deposit with 0 amount reverts
-    with direct_vm.expect_revert("Deposit amount must be greater than 0"):
-        contract.deposit_escrow(0)
+    # Deposit with 0 attached value reverts
+    direct_vm.value = 0
+    with direct_vm.expect_revert("Must attach positive native value (gl.message.value > 0) to deposit_escrow"):
+        contract.deposit_escrow()
 
-    contract.deposit_escrow(5000)
+    # Deposit valid value
+    direct_vm.value = 5000
+    contract.deposit_escrow()
+    direct_vm.value = 0
 
     # Client cannot be contributor
     with direct_vm.expect_revert("Contributor cannot be client"):
@@ -300,7 +486,13 @@ def test_guardrails_and_reverts(direct_vm, direct_deploy, direct_alice, direct_b
     with direct_vm.expect_revert("unique non-empty string"):
         contract.create_milestone(direct_bob, "Duplicate rubric milestone", dup_rubric, 5000, 3, 5)
 
+    # Only owner can set timelock keeper
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("Only owner can set timelock keeper"):
+        contract.set_timelock_keeper(direct_bob)
+
     # Create valid milestone
+    direct_vm.sender = direct_alice
     m_id = contract.create_milestone(direct_bob, "Valid milestone project", valid_rubric, 5000, 2, 5)
 
     # Only contributor can submit deliverable
